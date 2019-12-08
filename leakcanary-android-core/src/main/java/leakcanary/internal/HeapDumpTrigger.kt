@@ -4,17 +4,19 @@ import android.app.Application
 import android.app.Notification
 import android.app.NotificationManager
 import android.content.Context
+import android.content.res.Resources
 import android.os.Handler
 import android.os.SystemClock
 import com.squareup.leakcanary.core.R
+import leakcanary.AppWatcher
 import leakcanary.GcTrigger
 import leakcanary.KeyedWeakReference
 import leakcanary.LeakCanary.Config
-import leakcanary.AppWatcher
 import leakcanary.ObjectWatcher
 import leakcanary.internal.NotificationReceiver.Action.CANCEL_NOTIFICATION
 import leakcanary.internal.NotificationReceiver.Action.DUMP_HEAP
 import leakcanary.internal.NotificationType.LEAKCANARY_LOW
+import shark.AndroidResourceIds
 import shark.SharkLog
 
 @Suppress("TooManyFunctions")
@@ -96,26 +98,79 @@ internal class HeapDumpTrigger(
       showRetainedCountWithDebuggerAttached(retainedReferenceCount)
       scheduleRetainedObjectCheck("debugger was attached", WAIT_FOR_DEBUG_MILLIS)
       SharkLog.d {
-          "Not checking for leaks while the debugger is attached, will retry in $WAIT_FOR_DEBUG_MILLIS ms"
+        "Not checking for leaks while the debugger is attached, will retry in $WAIT_FOR_DEBUG_MILLIS ms"
       }
       return
     }
 
     SharkLog.d { "Found $retainedReferenceCount retained references, dumping the heap" }
+    dismissRetainedCountNotification()
+    dumpHeap(retainedReferenceCount, retry = true)
+  }
+
+  private fun dumpHeap(
+    retainedReferenceCount: Int,
+    retry: Boolean
+  ) {
+    if (!AndroidResourceIds.isSet) {
+      val before = SystemClock.uptimeMillis()
+      AndroidResourceIds.saveResourceIds(retrieveResourceIds())
+      SharkLog.d { "Duration: ${SystemClock.uptimeMillis() - before} ms" }
+    }
+
     val heapDumpUptimeMillis = SystemClock.uptimeMillis()
     KeyedWeakReference.heapDumpUptimeMillis = heapDumpUptimeMillis
-    dismissRetainedCountNotification()
     val heapDumpFile = heapDumper.dumpHeap()
     if (heapDumpFile == null) {
-      SharkLog.d { "Failed to dump heap, will retry in $WAIT_AFTER_DUMP_FAILED_MILLIS ms" }
-      scheduleRetainedObjectCheck("failed to dump heap", WAIT_AFTER_DUMP_FAILED_MILLIS)
+      if (retry) {
+        SharkLog.d { "Failed to dump heap, will retry in $WAIT_AFTER_DUMP_FAILED_MILLIS ms" }
+        scheduleRetainedObjectCheck("failed to dump heap", WAIT_AFTER_DUMP_FAILED_MILLIS)
+      } else {
+        SharkLog.d { "Failed to dump heap" }
+      }
       showRetainedCountWithHeapDumpFailed(retainedReferenceCount)
       return
     }
     lastDisplayedRetainedObjectCount = 0
     objectWatcher.clearObjectsWatchedBefore(heapDumpUptimeMillis)
-
     HeapAnalyzerService.runAnalysis(application, heapDumpFile)
+  }
+
+  private fun retrieveResourceIds(): List<Pair<Int, String>> {
+    val resourceIds = mutableListOf<Pair<Int, String>>()
+    findResourceIdStart()?.let { idStart ->
+      val resources = application.resources
+      var id = idStart
+      while (true) {
+        try {
+          val entry = resources.getResourceEntryName(id)
+          resourceIds += id to entry
+          id++
+        } catch (e: Resources.NotFoundException) {
+          break
+        }
+      }
+    }
+    return resourceIds
+  }
+
+  private fun findResourceIdStart(): Int? {
+    // Based on https://jebware.com/blog/?p=600 (itself based on https://stackoverflow.com/a/6646113/703646)
+    val start = 0x7F010000
+    val typeIterator = 0x00010000
+
+    var groupId = start
+    while (true) {
+      try {
+        val groupName = application.resources.getResourceTypeName(groupId)
+        if (groupName == "id") {
+          return groupId
+        }
+        groupId += typeIterator
+      } catch (e: Resources.NotFoundException) {
+        return null
+      }
+    }
   }
 
   fun onDumpHeapReceived(forceDump: Boolean) {
@@ -150,19 +205,8 @@ internal class HeapDumpTrigger(
         return@post
       }
 
-      val heapDumpUptimeMillis = SystemClock.uptimeMillis()
-      KeyedWeakReference.heapDumpUptimeMillis = heapDumpUptimeMillis
-      SharkLog.d { "Dumping the heap because user tapped notification" }
-
-      val heapDumpFile = heapDumper.dumpHeap()
-      if (heapDumpFile == null) {
-        SharkLog.d { "Failed to dump heap" }
-        showRetainedCountWithHeapDumpFailed(retainedReferenceCount)
-        return@post
-      }
-      lastDisplayedRetainedObjectCount = 0
-      objectWatcher.clearObjectsWatchedBefore(heapDumpUptimeMillis)
-      HeapAnalyzerService.runAnalysis(application, heapDumpFile)
+      SharkLog.d { "Dumping the heap because user requested it" }
+      dumpHeap(retainedReferenceCount, retry = false)
     }
   }
 
@@ -183,7 +227,7 @@ internal class HeapDumpTrigger(
     if (retainedKeysCount < retainedVisibleThreshold) {
       if (applicationVisible || applicationInvisibleLessThanWatchPeriod) {
         SharkLog.d {
-            "Found $retainedKeysCount retained objects, which is less than the visible threshold of $retainedVisibleThreshold"
+          "Found $retainedKeysCount retained objects, which is less than the visible threshold of $retainedVisibleThreshold"
         }
         showRetainedCountBelowThresholdNotification(retainedKeysCount, retainedVisibleThreshold)
         scheduleRetainedObjectCheck(
